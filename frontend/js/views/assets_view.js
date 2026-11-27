@@ -4,7 +4,7 @@ window.SB_VIEWS["assets-view"] = {
   <div>
     <div class="panel">
       <h2>素材台账</h2>
-      <p class="lead">图片 / 视频 / 网页页 / 滚动条，可播后才能进清单。</p>
+      <p class="lead">图片 / 视频 / 网页页 / 滚动条，可播后才能进清单；入清单时按分辨率族校验目标屏幕。</p>
       <div class="row-form">
         <input v-model="form.code" placeholder="编码" />
         <input v-model="form.title" placeholder="标题" />
@@ -17,11 +17,13 @@ window.SB_VIEWS["assets-view"] = {
     </div>
     <div class="panel">
       <table>
-        <thead><tr><th>编码</th><th>标题</th><th>种类</th><th>时长</th><th>分辨率</th><th>状态</th></tr></thead>
+        <thead><tr><th>编码</th><th>标题</th><th>种类</th><th>时长</th><th>分辨率</th><th>分辨率族</th><th>状态</th></tr></thead>
         <tbody>
           <tr v-for="a in items" :key="a.id">
             <td>{{ a.code }}</td><td>{{ a.title }}</td><td>{{ a.kind_label }}</td>
-            <td>{{ a.duration_sec }}s</td><td>{{ a.resolution }}</td><td>{{ a.status_label }}</td>
+            <td>{{ a.duration_sec }}s</td><td>{{ a.resolution }}</td>
+            <td><span class="badge" :class="a.family==='portrait'?'warn':(a.family?'':'bad')">{{ a.family_label }}</span></td>
+            <td>{{ a.status_label }}</td>
           </tr>
         </tbody>
       </table>

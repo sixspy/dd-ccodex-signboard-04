@@ -4,14 +4,55 @@ from __future__ import annotations
 import time
 from fastapi import APIRouter, Header, HTTPException
 
-from audit_svc import write_audit, write_history
+from audit_svc import write_audit, write_history, write_rejection
 from auth import current_user, require_writer
 from db import connect, rows_to_list
 from locks import acquire, release
-from policies import assert_playlist_ready, assert_screen_online, assert_window_open
+from policies import (
+    assert_playlist_ready,
+    assert_screen_online,
+    assert_window_open,
+    family_label,
+    resolution_family,
+)
 from validators import require_positive_int, require_title
 
 router = APIRouter(prefix="/api/publish", tags=["publish"])
+
+
+def _incompatible_items(conn, playlist_id: int, screen_res: str) -> list[dict]:
+    """发布闸：逐条核算清单条目素材族 × 目标屏幕族，返回不兼容条目。"""
+    rows = rows_to_list(
+        conn.execute(
+            """
+            SELECT a.code, a.resolution
+            FROM playlist_items i JOIN assets a ON a.id=i.asset_id
+            WHERE i.playlist_id=? ORDER BY i.seq
+            """,
+            (playlist_id,),
+        ).fetchall()
+    )
+    sf = resolution_family(screen_res)
+    return [
+        {"asset_code": r["code"], "asset_resolution": r["resolution"], "screen_resolution": screen_res}
+        for r in rows
+        if resolution_family(r["resolution"]) != sf
+    ]
+
+
+def _reject_incompatible(user, playlist_id: int, screen_id: int, bad: list[dict]) -> None:
+    """含不兼容条目的清单不得被当成可播齐套：留痕后整笔 409。"""
+    b = bad[0]
+    detail = (
+        f"清单含不兼容条目 {b['asset_code']}({b['asset_resolution']}) "
+        f"vs 目标屏幕分辨率 {b['screen_resolution']}"
+        f"({family_label(b['screen_resolution'])})，禁止发布上屏"
+    )
+    write_rejection(
+        user["username"], "publish.reject_resolution", "playlist", playlist_id,
+        detail, {"playlist_id": playlist_id, "screen_id": screen_id, "bad": bad},
+    )
+    raise HTTPException(409, detail)
 
 
 @router.get("/official")
@@ -68,7 +109,7 @@ def _load_refs(conn, screen_id, playlist_id, window_id):
 
 @router.post("/official")
 def publish_official(body: dict, authorization: str | None = Header(default=None)):
-    """甲路径：同事务写入正式发布并升版本。"""
+    """甲路径：同事务写入正式发布并升版本；发布闸全校条目兼容性。"""
     user = current_user(authorization)
     require_writer(user)
     screen_id = require_positive_int(body.get("screen_id"), "屏幕编号")
@@ -79,31 +120,37 @@ def publish_official(body: dict, authorization: str | None = Header(default=None
     lock_key = f"publish:{screen_id}"
     acquire(lock_key, user["username"])
     try:
+        bad = None
         with connect() as conn:
-            _load_refs(conn, screen_id, playlist_id, window_id)
-            prev = conn.execute(
-                "SELECT version FROM publications WHERE screen_id=? AND official=1",
-                (screen_id,),
-            ).fetchone()
-            version = (prev["version"] + 1) if prev else 1
-            conn.execute("DELETE FROM publications WHERE screen_id=? AND official=1", (screen_id,))
-            cur = conn.execute(
-                "INSERT INTO publications(screen_id,playlist_id,window_id,layout_id,version,summary,status,official,published_at,published_by) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    screen_id,
-                    playlist_id,
-                    window_id,
-                    layout_id,
-                    version,
-                    summary,
-                    "published",
-                    1,
-                    time.time(),
-                    user["username"],
-                ),
-            )
-            pid = cur.lastrowid
-            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            screen, _, _ = _load_refs(conn, screen_id, playlist_id, window_id)
+            bad = _incompatible_items(conn, playlist_id, screen["resolution"])
+            if not bad:
+                prev = conn.execute(
+                    "SELECT version FROM publications WHERE screen_id=? AND official=1",
+                    (screen_id,),
+                ).fetchone()
+                version = (prev["version"] + 1) if prev else 1
+                conn.execute("DELETE FROM publications WHERE screen_id=? AND official=1", (screen_id,))
+                cur = conn.execute(
+                    "INSERT INTO publications(screen_id,playlist_id,window_id,layout_id,version,summary,status,official,published_at,published_by) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        screen_id,
+                        playlist_id,
+                        window_id,
+                        layout_id,
+                        version,
+                        summary,
+                        "published",
+                        1,
+                        time.time(),
+                        user["username"],
+                    ),
+                )
+                pid = cur.lastrowid
+                conn.commit()
+        if bad:
+            _reject_incompatible(user, playlist_id, screen_id, bad)
         write_history("publication", pid, "publish_official", summary, user["username"])
         write_audit(user["username"], "publish.official", {"id": pid, "version": version})
         return {"id": pid, "version": version, "path": "official"}
@@ -113,7 +160,7 @@ def publish_official(body: dict, authorization: str | None = Header(default=None
 
 @router.post("/shadow")
 def create_shadow(body: dict, authorization: str | None = Header(default=None)):
-    """乙路径第一步：只写影子草案，正式区零改。"""
+    """乙路径第一步：只写影子草案，正式区零改；发布闸同样全校。"""
     user = current_user(authorization)
     require_writer(user)
     screen_id = require_positive_int(body.get("screen_id"), "屏幕编号")
@@ -121,30 +168,36 @@ def create_shadow(body: dict, authorization: str | None = Header(default=None)):
     window_id = require_positive_int(body.get("window_id"), "时段编号")
     summary = require_title(body.get("summary") or "影子发布草案", "发布摘要")
     layout_id = body.get("layout_id")
+    bad = None
     with connect() as conn:
-        _load_refs(conn, screen_id, playlist_id, window_id)
-        cur = conn.execute(
-            "INSERT INTO publish_shadows(screen_id,playlist_id,window_id,layout_id,summary,status,created_at,created_by) VALUES(?,?,?,?,?,?,?,?)",
-            (
-                screen_id,
-                playlist_id,
-                window_id,
-                layout_id,
-                summary,
-                "open",
-                time.time(),
-                user["username"],
-            ),
-        )
-        sid = cur.lastrowid
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        screen, _, _ = _load_refs(conn, screen_id, playlist_id, window_id)
+        bad = _incompatible_items(conn, playlist_id, screen["resolution"])
+        if not bad:
+            cur = conn.execute(
+                "INSERT INTO publish_shadows(screen_id,playlist_id,window_id,layout_id,summary,status,created_at,created_by) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    screen_id,
+                    playlist_id,
+                    window_id,
+                    layout_id,
+                    summary,
+                    "open",
+                    time.time(),
+                    user["username"],
+                ),
+            )
+            sid = cur.lastrowid
+            conn.commit()
+    if bad:
+        _reject_incompatible(user, playlist_id, screen_id, bad)
     write_history("publish_shadow", sid, "create", summary, user["username"])
     return {"id": sid, "path": "shadow", "status": "open"}
 
 
 @router.post("/shadow/{shadow_id}/promote")
 def promote_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
-    """乙路径升正：原子落正式区。"""
+    """乙路径升正：原子落正式区；升正前按目标屏幕重校清单条目。"""
     user = current_user(authorization)
     require_writer(user)
     with connect() as conn:
@@ -157,36 +210,42 @@ def promote_shadow(shadow_id: int, authorization: str | None = Header(default=No
     lock_key = f"publish:{screen_id}"
     acquire(lock_key, user["username"])
     try:
+        bad = None
         with connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             sh = conn.execute("SELECT * FROM publish_shadows WHERE id=?", (shadow_id,)).fetchone()
-            _load_refs(conn, sh["screen_id"], sh["playlist_id"], sh["window_id"])
-            prev = conn.execute(
-                "SELECT version FROM publications WHERE screen_id=? AND official=1",
-                (sh["screen_id"],),
-            ).fetchone()
-            version = (prev["version"] + 1) if prev else 1
-            conn.execute("DELETE FROM publications WHERE screen_id=? AND official=1", (sh["screen_id"],))
-            cur = conn.execute(
-                "INSERT INTO publications(screen_id,playlist_id,window_id,layout_id,version,summary,status,official,published_at,published_by) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    sh["screen_id"],
-                    sh["playlist_id"],
-                    sh["window_id"],
-                    sh["layout_id"],
-                    version,
-                    sh["summary"],
-                    "published",
-                    1,
-                    time.time(),
-                    user["username"],
-                ),
-            )
-            pid = cur.lastrowid
-            conn.execute(
-                "UPDATE publish_shadows SET status='promoted' WHERE id=?",
-                (shadow_id,),
-            )
-            conn.commit()
+            screen, _, _ = _load_refs(conn, sh["screen_id"], sh["playlist_id"], sh["window_id"])
+            bad = _incompatible_items(conn, sh["playlist_id"], screen["resolution"])
+            if not bad:
+                prev = conn.execute(
+                    "SELECT version FROM publications WHERE screen_id=? AND official=1",
+                    (sh["screen_id"],),
+                ).fetchone()
+                version = (prev["version"] + 1) if prev else 1
+                conn.execute("DELETE FROM publications WHERE screen_id=? AND official=1", (sh["screen_id"],))
+                cur = conn.execute(
+                    "INSERT INTO publications(screen_id,playlist_id,window_id,layout_id,version,summary,status,official,published_at,published_by) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        sh["screen_id"],
+                        sh["playlist_id"],
+                        sh["window_id"],
+                        sh["layout_id"],
+                        version,
+                        sh["summary"],
+                        "published",
+                        1,
+                        time.time(),
+                        user["username"],
+                    ),
+                )
+                pid = cur.lastrowid
+                conn.execute(
+                    "UPDATE publish_shadows SET status='promoted' WHERE id=?",
+                    (shadow_id,),
+                )
+                conn.commit()
+        if bad:
+            _reject_incompatible(user, sh["playlist_id"], sh["screen_id"], bad)
         write_history("publication", pid, "promote_shadow", f"升正影子 {shadow_id}", user["username"])
         write_audit(user["username"], "publish.promote", {"shadow_id": shadow_id, "id": pid})
         return {"id": pid, "version": version, "path": "shadow_promote"}

@@ -7,6 +7,7 @@ from audit_svc import write_audit, write_history
 from auth import current_user, require_writer
 from db import connect, rows_to_list
 from models import SCREEN_STATUS_LABEL, ZONE_TYPE_LABEL
+from policies import family_label, resolution_family
 from validators import require_code, require_screen_status, require_title
 
 router = APIRouter(prefix="/api/screens", tags=["screens"])
@@ -38,6 +39,8 @@ def list_screens(authorization: str | None = Header(default=None)):
         d = dict(r)
         d["status_label"] = SCREEN_STATUS_LABEL.get(d["status"], d["status"])
         d["zone_type_label"] = ZONE_TYPE_LABEL.get(d["zone_type"], d["zone_type"])
+        d["family"] = resolution_family(d["resolution"])
+        d["family_label"] = family_label(d["resolution"])
         items.append(d)
     return {"items": items}
 
@@ -50,6 +53,8 @@ def create_screen(body: dict, authorization: str | None = Header(default=None)):
     title = require_title(body.get("title"), "屏幕标题")
     status = require_screen_status(body.get("status") or "offline")
     resolution = (body.get("resolution") or "1920x1080").strip()
+    if resolution_family(resolution) is None:
+        raise HTTPException(400, "分辨率格式须为 宽x高（如 1080x1920）")
     orientation = body.get("orientation") or "landscape"
     zone_code = (body.get("zone_code") or "").strip()
     with connect() as conn:

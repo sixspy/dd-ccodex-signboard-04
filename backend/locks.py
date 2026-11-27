@@ -11,20 +11,25 @@ router = APIRouter(prefix="/api/locks", tags=["locks"])
 
 
 def acquire(lock_key: str, holder: str, ttl_sec: int = 20) -> None:
+    """原子取锁：单条 upsert 以持有者/过期为条件，影响行数定胜负，不留双成窗口。"""
     now = time.time()
     with connect() as conn:
-        row = conn.execute(
-            "SELECT holder, expires_at FROM write_locks WHERE lock_key=?",
-            (lock_key,),
-        ).fetchone()
-        if row and row["expires_at"] > now and row["holder"] != holder:
-            raise HTTPException(409, f"资源锁定中：{row['holder']}")
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO write_locks(lock_key,holder,expires_at) VALUES(?,?,?) "
-            "ON CONFLICT(lock_key) DO UPDATE SET holder=excluded.holder, expires_at=excluded.expires_at",
-            (lock_key, holder, now + ttl_sec),
+            "ON CONFLICT(lock_key) DO UPDATE SET holder=excluded.holder, expires_at=excluded.expires_at "
+            "WHERE write_locks.expires_at<=? OR write_locks.holder=?",
+            (lock_key, holder, now + ttl_sec, now, holder),
         )
+        won = cur.rowcount > 0
+        holder_now = None
+        if not won:
+            row = conn.execute(
+                "SELECT holder FROM write_locks WHERE lock_key=?", (lock_key,)
+            ).fetchone()
+            holder_now = row["holder"] if row else "unknown"
         conn.commit()
+    if not won:
+        raise HTTPException(409, f"资源锁定中：{holder_now}")
 
 
 def release(lock_key: str, holder: str) -> None:

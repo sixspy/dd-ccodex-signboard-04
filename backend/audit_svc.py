@@ -29,6 +29,29 @@ def write_history(entity_kind: str, entity_id: int, action: str, detail: str, ac
         conn.commit()
 
 
+def write_rejection(
+    actor: str,
+    action: str,
+    entity_kind: str,
+    entity_id: int,
+    detail: str,
+    payload: dict,
+) -> None:
+    """拒写/争用败北留痕：审计日志与变更历史同源各记一笔，正式数据零改。"""
+    now = time.time()
+    blob = json.dumps(payload, ensure_ascii=False)
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO audit_log(actor,action,payload,created_at) VALUES(?,?,?,?)",
+            (actor, action, blob, now),
+        )
+        conn.execute(
+            "INSERT INTO change_history(entity_kind,entity_id,action,detail,actor,created_at) VALUES(?,?,?,?,?,?)",
+            (entity_kind, entity_id, action, detail, actor, now),
+        )
+        conn.commit()
+
+
 @router.get("/recent")
 def recent(limit: int = 50, authorization: str | None = Header(default=None)):
     current_user(authorization)

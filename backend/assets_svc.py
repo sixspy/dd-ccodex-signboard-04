@@ -8,6 +8,7 @@ from audit_svc import write_audit, write_history
 from auth import current_user, require_writer
 from db import connect, row_to_dict, rows_to_list
 from models import ASSET_KIND_LABEL, ASSET_STATUS_LABEL, DEFAULT_DURATIONS
+from policies import family_label, resolution_family
 from validators import require_asset_status, require_code, require_kind, require_positive_int, require_title
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
@@ -16,6 +17,8 @@ router = APIRouter(prefix="/api/assets", tags=["assets"])
 def _enrich(row: dict) -> dict:
     row["kind_label"] = ASSET_KIND_LABEL.get(row["kind"], row["kind"])
     row["status_label"] = ASSET_STATUS_LABEL.get(row["status"], row["status"])
+    row["family"] = resolution_family(row["resolution"])
+    row["family_label"] = family_label(row["resolution"])
     return row
 
 
@@ -48,6 +51,8 @@ def create_asset(body: dict, authorization: str | None = Header(default=None)):
         body.get("duration_sec", DEFAULT_DURATIONS.get(kind, 10)), "时长", 1, 3600
     )
     resolution = (body.get("resolution") or "1920x1080").strip()
+    if resolution_family(resolution) is None:
+        raise HTTPException(400, "分辨率格式须为 宽x高（如 1920x1080）")
     status = require_asset_status(body.get("status") or "draft")
     checksum = (body.get("checksum") or "").strip()
     with connect() as conn:
